@@ -1,27 +1,91 @@
-name: CD - Deploy to AKS
+name: CD - Deploy Backend & Frontend to AKS
 
 on:
-  workflow_run:
-    workflows: ["CI - Build & Test (Backend + Frontend)"]
-    branches: [main]
-    types: [completed]
+  workflow_dispatch:
+    inputs:
+      aks_cluster_name:
+        description: 'Name of the AKS Cluster to deploy to'
+        required: true
+      aks_resource_group:
+        description: 'Resource Group of the AKS Cluster'
+        required: true
+      acr_name:
+        description: 'Azure Container Registry name'
+        required: true
+      image_tag:
+        description: 'Docker image tag from CI'
+        required: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    environment: Production
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/login@v1
-        with: { creds: ${{ secrets.AZURE_CREDENTIALS }} }
-      - run: az aks get-credentials --resource-group ${{ secrets.AKS_RG }} --name ${{ secrets.AKS_CLUSTER }} --overwrite-existing
-      - run: |
+      # Checkout repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Azure login
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Set AKS context
+      - name: Set Kubernetes Context
+        run: |
+          az aks get-credentials --resource-group ${{ github.event.inputs.aks_resource_group }} --name ${{ github.event.inputs.aks_cluster_name }} --overwrite-existing
+          az aks update --name ${{ github.event.inputs.aks_cluster_name }} --resource-group ${{ github.event.inputs.aks_resource_group }} --attach-acr ${{ github.event.inputs.acr_name }}
+
+      # Deploy backend: ConfigMaps, Secrets, DBs
+      - name: Deploy Backend Infrastructure
+        run: |
           cd k8s/
           kubectl apply -f configmaps.yaml
           kubectl apply -f secrets.yaml
           kubectl apply -f product-db.yaml
           kubectl apply -f order-db.yaml
-          kubectl apply -f product-service.yaml
-          kubectl apply -f order-service.yaml
-          kubectl apply -f frontend.yaml
-      - run: az logout
+
+      # Deploy backend microservices using image tag from CI
+      - name: Deploy Backend Services
+        run: |
+          kubectl set image deployment/product-service-w09-aks product-service-container=${{ github.event.inputs.acr_name }}/product_service:${{ github.event.inputs.image_tag }}
+          kubectl set image deployment/order-service-w09-aks order-service-container=${{ github.event.inputs.acr_name }}/order_service:${{ github.event.inputs.image_tag }}
+
+      # Wait for LoadBalancer IPs
+      - name: Wait for Backend LoadBalancer IPs
+        run: |
+          echo "Waiting for backend LoadBalancer IPs..."
+          for i in $(seq 1 60); do
+            PRODUCT_IP=$(kubectl get svc product-service-w09-aks -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            ORDER_IP=$(kubectl get svc order-service-w09-aks -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [[ -n "$PRODUCT_IP" && -n "$ORDER_IP" ]]; then
+              echo "Product Service IP: $PRODUCT_IP"
+              echo "Order Service IP: $ORDER_IP"
+              break
+            fi
+            sleep 5
+          done
+          if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" ]]; then
+            echo "Error: LoadBalancer IPs not assigned"
+            exit 1
+          fi
+          echo "PRODUCT_IP=$PRODUCT_IP" >> $GITHUB_ENV
+          echo "ORDER_IP=$ORDER_IP" >> $GITHUB_ENV
+
+      # Deploy frontend with the new backend IPs
+      - name: Deploy Frontend Service
+        run: |
+          cd frontend
+          sed -i "s|_PRODUCT_API_URL_|http://$PRODUCT_IP:8000|g" static/js/main.js
+          sed -i "s|_ORDER_API_URL_|http://$ORDER_IP:8001|g" static/js/main.js
+          docker build -t ${{ github.event.inputs.acr_name }}/frontend:${{ github.event.inputs.image_tag }} .
+          docker push ${{ github.event.inputs.acr_name }}/frontend:${{ github.event.inputs.image_tag }}
+          cd ..
+          kubectl set image deployment/frontend-w09-aks frontend-container=${{ github.event.inputs.acr_name }}/frontend:${{ github.event.inputs.image_tag }}
+
+      # Logout from Azure
+      - name: Logout from Azure
+        if: always()
+        run: az logout
